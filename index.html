@@ -297,6 +297,7 @@ footer.site-footer .script{font-size:1.1rem;}
 </head>
 <body>
 <div id="app"></div>
+<script src="/config.js"></script>
 <script>
 /* ===================== Society of Jesus — single-file app ===================== */
 const ADMIN_KEY = "7kX801OPmsIk7256Kmw";
@@ -306,101 +307,69 @@ const SESSION_KEY = "sj_current_user";
 function uid(){ return Date.now().toString(36) + Math.random().toString(36).slice(2,8); }
 
 function defaultDB(){
-  // Production starter data: this is stored in the app's initial state so a
-  // fresh Vercel deployment is never an empty shell. Users can edit it from Admin.
-  const now = Date.now();
-  const day = 86400000;
   return {
-    users: {},
-    news: [
-      {
-        id:"welcome-news",
-        title:"Welcome to the Society of Jesus",
-        summary:"A place for formation, prayer, study, community, and mission.",
-        details:"Welcome to the Society of Jesus portal. Use the sections below to explore news, formation activities, liturgical resources, and community information. Administrators can replace this starter content with the community's own announcements.",
-        images:[],
-        links:[],
-        urgent:false,
-        createdAt:now,
-        expiresAt:now + 365*day
-      },
-      {
-        id:"formation-news",
-        title:"Formation & Mission",
-        summary:"Growing in faith, discernment, learning, and service.",
-        details:"The portal is designed to support ongoing formation through study, prayer, reflection, and service. New announcements can be published from the administrator panel.",
-        images:[],
-        links:[],
-        urgent:false,
-        createdAt:now,
-        expiresAt:now + 365*day
-      }
-    ],
-    exams: [
-      {
-        id:"formation-exam",
-        title:"Introduction to Jesuit Spirituality",
-        description:"Starter formation assessment. Administrators can replace these questions with the examination required by the community.",
-        questions:[
-          {id:"q1",type:"mcq",prompt:"Who founded the Society of Jesus?",options:["St. Ignatius of Loyola","St. Francis of Assisi","St. Benedict","St. Augustine"],correctIndex:0},
-          {id:"q2",type:"mcq",prompt:"What is the traditional motto associated with the Society of Jesus?",options:["Ad Majorem Dei Gloriam","Ora et Labora","Pax et Bonum","Deo Gratias"],correctIndex:0}
-        ],
-        submissions:[],
-        createdAt:now,
-        expiresAt:now + 365*day
-      }
-    ],
-    polls: [
-      {
-        id:"formation-poll",
-        title:"What would you like to see added next?",
-        options:["More formation material","More liturgical resources","More news and announcements","Community events"],
-        votes:[],
-        anonymous:false,
-        showPercentage:true,
-        createdAt:now,
-        expiresAt:now + 365*day
-      }
-    ],
-    dioceses: [],
-    books: [],
-    socialLinks: [],
-    information: "The Society of Jesus (the Jesuits) is a religious order of the Catholic Church founded by Saint Ignatius of Loyola in 1540. This portal supports formation, prayer, study, community, and mission. Administrators can edit this information from Settings.",
+    users: {}, news: [], exams: [], polls: [], dioceses: [], books: [], socialLinks: [],
+    information: "The Society of Jesus (the Jesuits) is a religious order of the Catholic Church founded by Saint Ignatius of Loyola in 1540. Members are called to find God in all things and to serve through education, faith formation, and mission. Edit this text from the admin panel.",
     roomsLink: ""
   };
+}
+/* ===================== DATABASE SYNC =====================
+   The UI keeps a local cache for speed, while admin changes are also
+   synchronized to the shared Vercel/Supabase database.
+   Configure /config.js before deploying (see README).
+*/
+const SITE_CONFIG = window.SITE_CONFIG || { apiBase: "/api", syncKey: "" };
+let remoteSyncTimer = null;
+
+function mergeDB(base, incoming){
+  return Object.assign(defaultDB(), incoming || {});
 }
 function loadDB(){
   try{
     const raw = localStorage.getItem(DB_KEY);
-    if(!raw){
-      const d = defaultDB();
-      saveDB(d);
-      return d;
-    }
-    const saved = JSON.parse(raw);
-    // If a previous deployment created an empty database, hydrate it once
-    // with the production starter content instead of showing an empty portal.
-    const looksEmpty = !saved.news?.length && !saved.exams?.length &&
-      !saved.polls?.length && !saved.books?.length && !saved.dioceses?.length &&
-      !saved.socialLinks?.length;
-    if(looksEmpty && !localStorage.getItem(DB_KEY + "_hydrated")){
-      const d = defaultDB();
-      d.users = saved.users || {};
-      d.information = saved.information || d.information;
-      d.roomsLink = saved.roomsLink || "";
-      saveDB(d);
-      localStorage.setItem(DB_KEY + "_hydrated", "1");
-      return d;
-    }
-    return Object.assign(defaultDB(), saved);
-  }catch(e){
-    console.error(e);
-    return defaultDB();
-  }
+    if(!raw){ const d = defaultDB(); localStorage.setItem(DB_KEY, JSON.stringify(d)); return d; }
+    return mergeDB(defaultDB(), JSON.parse(raw));
+  }catch(e){ console.error(e); return defaultDB(); }
 }
 function saveDB(db){
-  try{ localStorage.setItem(DB_KEY, JSON.stringify(db)); return true; }
+  try{
+    localStorage.setItem(DB_KEY, JSON.stringify(db));
+    // Only the administrator publishes the full shared database.
+    if(isAdmin() && SITE_CONFIG.syncKey){
+      clearTimeout(remoteSyncTimer);
+      remoteSyncTimer = setTimeout(()=>pushRemoteDB(db), 150);
+    }
+    return true;
+  }
   catch(e){ alert("Storage is full — try removing an image or two before adding more."); return false; }
+}
+async function pushRemoteDB(db){
+  try{
+    const r = await fetch(`${SITE_CONFIG.apiBase}/db`, {
+      method:'POST', headers:{'Content-Type':'application/json','X-Site-Sync-Key':SITE_CONFIG.syncKey},
+      body:JSON.stringify({data:db})
+    });
+    if(!r.ok) throw new Error(await r.text());
+    console.log('Shared database saved.');
+  }catch(e){ console.error('Shared database save failed:', e); }
+}
+async function pullRemoteDB(){
+  try{
+    const r = await fetch(`${SITE_CONFIG.apiBase}/db`, {cache:'no-store'});
+    if(!r.ok) throw new Error(await r.text());
+    const payload = await r.json();
+    if(payload && payload.data){
+      const remote = mergeDB(defaultDB(), payload.data);
+      localStorage.setItem(DB_KEY, JSON.stringify(remote));
+      return remote;
+    }
+  }catch(e){ console.warn('Shared database unavailable; using local cache.', e); }
+  return loadDB();
+}
+async function bootstrapRemote(){
+  const remote = await pullRemoteDB();
+  // Render again after the shared data arrives so every visitor sees the same content.
+  if(remote) renderRoute();
 }
 function getCurrentUser(){ return localStorage.getItem(SESSION_KEY) || ""; }
 function setCurrentUser(name){ localStorage.setItem(SESSION_KEY, name); }
@@ -452,7 +421,7 @@ function renderRoute(){
   return renderSignIn(app);
 }
 window.addEventListener('hashchange', renderRoute);
-window.addEventListener('DOMContentLoaded', renderRoute);
+window.addEventListener('DOMContentLoaded', bootstrapRemote);
 
 /* ---------------- shared bits ---------------- */
 function topbarMain(){
