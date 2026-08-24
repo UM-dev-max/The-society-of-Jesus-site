@@ -306,42 +306,96 @@ const SESSION_KEY = "sj_current_user";
 
 function uid(){ return Date.now().toString(36) + Math.random().toString(36).slice(2,8); }
 
+/* ===================== STORAGE HELPERS =====================
+   Centralized, defensive localStorage access. Every read is safely
+   parsed (corrupted/missing data never throws or wipes anything),
+   and every write is guarded so a full quota doesn't silently lose data.
+*/
+function safeParse(raw, fallback){
+  if(raw === null || raw === undefined) return fallback;
+  try{
+    const parsed = JSON.parse(raw);
+    return (parsed === null || parsed === undefined) ? fallback : parsed;
+  }catch(e){
+    console.error('Corrupted JSON in storage, using fallback.', e);
+    return fallback;
+  }
+}
+function saveData(key, value){
+  try{
+    localStorage.setItem(key, JSON.stringify(value));
+    return true;
+  }catch(e){
+    console.error(`Failed to save "${key}" to localStorage.`, e);
+    alert("Storage is full — try removing an image or two before adding more.");
+    return false;
+  }
+}
+function loadData(key, fallback){
+  try{
+    return safeParse(localStorage.getItem(key), fallback);
+  }catch(e){
+    console.error(`Failed to read "${key}" from localStorage.`, e);
+    return fallback;
+  }
+}
+function removeData(key){
+  try{ localStorage.removeItem(key); return true; }
+  catch(e){ console.error(`Failed to remove "${key}" from localStorage.`, e); return false; }
+}
+
 function defaultDB(){
   return {
     users: {}, news: [], exams: [], polls: [], dioceses: [], books: [], socialLinks: [],
     information: "The Society of Jesus (the Jesuits) is a religious order of the Catholic Church founded by Saint Ignatius of Loyola in 1540. Members are called to find God in all things and to serve through education, faith formation, and mission. Edit this text from the admin panel.",
-    roomsLink: ""
+    roomsLink: "",
+    updatedAt: 0
   };
 }
 /* ===================== DATABASE SYNC =====================
    The UI keeps a local cache for speed, while admin changes are also
    synchronized to the shared Vercel/Supabase database.
    Configure /config.js before deploying (see README).
+
+   IMPORTANT: localStorage is always the source of truth for what's on
+   screen. The remote database is only ever pulled in and applied if it
+   is demonstrably NEWER (via updatedAt) than what's already saved
+   locally — it never blindly overwrites local data. This is what
+   previously caused freshly-saved data to "disappear": the app fetched
+   the remote copy on every page load and overwrote localStorage with
+   it unconditionally, even when the remote copy was older/emptier
+   (e.g. the background push hadn't finished yet, or no backend was
+   configured and the shared endpoint returned stale/default data).
 */
 const SITE_CONFIG = window.SITE_CONFIG || { apiBase: "/api", syncKey: "" };
 let remoteSyncTimer = null;
 
 function mergeDB(base, incoming){
-  return Object.assign(defaultDB(), incoming || {});
+  const merged = Object.assign(defaultDB(), incoming || {});
+  if(typeof merged.updatedAt !== 'number') merged.updatedAt = 0;
+  return merged;
 }
 function loadDB(){
-  try{
-    const raw = localStorage.getItem(DB_KEY);
-    if(!raw){ const d = defaultDB(); localStorage.setItem(DB_KEY, JSON.stringify(d)); return d; }
-    return mergeDB(defaultDB(), JSON.parse(raw));
-  }catch(e){ console.error(e); return defaultDB(); }
+  const existingRaw = localStorage.getItem(DB_KEY);
+  if(existingRaw === null){
+    // First run only: seed localStorage with defaults. Never touches
+    // an existing (even empty-looking) saved value.
+    const d = defaultDB();
+    saveData(DB_KEY, d);
+    return d;
+  }
+  return mergeDB(defaultDB(), safeParse(existingRaw, null));
 }
 function saveDB(db){
-  try{
-    localStorage.setItem(DB_KEY, JSON.stringify(db));
-    // Only the administrator publishes the full shared database.
-    if(isAdmin() && SITE_CONFIG.syncKey){
-      clearTimeout(remoteSyncTimer);
-      remoteSyncTimer = setTimeout(()=>pushRemoteDB(db), 150);
-    }
-    return true;
+  db.updatedAt = Date.now();
+  const ok = saveData(DB_KEY, db);
+  if(!ok) return false;
+  // Only the administrator publishes the full shared database.
+  if(isAdmin() && SITE_CONFIG.syncKey){
+    clearTimeout(remoteSyncTimer);
+    remoteSyncTimer = setTimeout(()=>pushRemoteDB(db), 150);
   }
-  catch(e){ alert("Storage is full — try removing an image or two before adding more."); return false; }
+  return true;
 }
 async function pushRemoteDB(db){
   try{
@@ -354,25 +408,37 @@ async function pushRemoteDB(db){
   }catch(e){ console.error('Shared database save failed:', e); }
 }
 async function pullRemoteDB(){
+  // Only attempt a remote pull if a backend is actually configured.
+  // With no backend, there is nothing to merge in, and we must not
+  // risk overwriting local data with an unexpected response.
+  if(!SITE_CONFIG || !SITE_CONFIG.apiBase) return null;
   try{
     const r = await fetch(`${SITE_CONFIG.apiBase}/db`, {cache:'no-store'});
     if(!r.ok) throw new Error(await r.text());
     const payload = await r.json();
     if(payload && payload.data){
       const remote = mergeDB(defaultDB(), payload.data);
-      localStorage.setItem(DB_KEY, JSON.stringify(remote));
-      return remote;
+      const local = loadDB();
+      // Only adopt the remote copy if it is strictly newer than what
+      // we already have saved locally. Otherwise keep local as-is.
+      if((remote.updatedAt || 0) > (local.updatedAt || 0)){
+        saveData(DB_KEY, remote);
+        return remote;
+      }
+      return local;
     }
   }catch(e){ console.warn('Shared database unavailable; using local cache.', e); }
-  return loadDB();
+  return null;
 }
 async function bootstrapRemote(){
+  // Try to pull a newer shared copy in the background. If nothing
+  // newer is found (no backend, network failure, or local is already
+  // up to date), the local render already on screen is left untouched.
   const remote = await pullRemoteDB();
-  // Render again after the shared data arrives so every visitor sees the same content.
   if(remote) renderRoute();
 }
-function getCurrentUser(){ return localStorage.getItem(SESSION_KEY) || ""; }
-function setCurrentUser(name){ localStorage.setItem(SESSION_KEY, name); }
+function getCurrentUser(){ return loadData(SESSION_KEY, "") || ""; }
+function setCurrentUser(name){ saveData(SESSION_KEY, name); }
 function isAdmin(){ return getCurrentUser() === ADMIN_KEY; }
 function fmtDate(ts){ if(!ts) return ""; return new Date(ts).toLocaleDateString(undefined,{year:'numeric',month:'short',day:'numeric'}); }
 function daysFromNow(n){ const d=new Date(); d.setDate(d.getDate()+Number(n)); return d.getTime(); }
@@ -421,7 +487,13 @@ function renderRoute(){
   return renderSignIn(app);
 }
 window.addEventListener('hashchange', renderRoute);
-window.addEventListener('DOMContentLoaded', bootstrapRemote);
+window.addEventListener('DOMContentLoaded', () => {
+  // Render immediately from local data — don't make the first paint
+  // wait on a network round-trip. bootstrapRemote() will silently
+  // re-render only if it finds a genuinely newer shared copy.
+  renderRoute();
+  bootstrapRemote();
+});
 
 /* ---------------- shared bits ---------------- */
 function topbarMain(){
